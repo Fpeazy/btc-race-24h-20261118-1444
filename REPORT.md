@@ -1,7 +1,11 @@
 # REPORT — Two-mode DP-table bot, btc-race-24h-20261118-1444
 
 Repo: https://github.com/Fpeazy/btc-race-24h-20261118-1444 (branch `main`)
-Entry commit (code): `ed95e81` (full: ed95e8174cbcc40173ed6fe8272ec01d2550b440)
+Entry commit: `fef5662` (full: fef56622c44785c0438139641399c24b0b9645e1)
+— the graded code is commit `ed95e81` (full:
+ed95e8174cbcc40173ed6fe8272ec01d2550b440); `fef5662` adds only this
+REPORT.md on top of it. The parent re-bundles and re-checks at `fef5662`
+after attaching usage rows (see below).
 Title (suggested): "Two-Mode Tranche Racer — DP schedule + Dip-Buyer"
 Status: **BUILT, GRADED, KIT-CHECKED. NOT SUBMITTED — Fxzy decides the submit.**
 Deadline: entries close **03:44 WIB 19 Nov 2026**. Quota (checked 23:38 WIB):
@@ -82,7 +86,7 @@ day's deepest dip is set early, it is rarely beaten. A stronger guard
 after 1200") is a decision for Fxzy — NOT implemented here, per the
 follow-up's exact spec.
 
-## Kit check (commit ed95e81, bundle eac85bff…)
+## Kit check (commit fef5662, bundle v2 e3b128eb…)
 
 **14 passed, 1 failed, 5 skipped, 3 checked at submission.**
 
@@ -90,11 +94,15 @@ follow-up's exact spec.
   repo_created_after_open (drand round 34072244, after opening),
   transcripts_present (6 sessions), transcripts_recorded,
   thinking_wellformed, thinking_in_window (all 382 timestamps in window),
-  **thinking_reproduces 84.1% (381/453 authored, 0 pasted; entrypoint
+  **thinking_reproduces 87.9% (532/605 authored, 0 pasted; entrypoint
   main.ts 375 authored lines)**, thinking_on_task (4/4), thinking_turns
   (170), **transcripts_run_record — the NEW rules PASS: handed-off prompt,
   system prompt UPLOADED (real file), instruction files COLLECTED (1),
   no MCP server**.
+  (At the code-only commit ed95e81 with the first bundle it was 84.1%
+  (381/453); adding this REPORT.md and re-bundling brought it to 87.9%,
+  because the re-bundle covers this file's write too. Both are above the
+  competition's min_authored_coverage 0.8.)
 - FAIL: **thinking_priced only — 0 usage rows.** Expected: a subagent's
   usage row is written only once its run completes. **The parent must
   attach the usage rows (agent ids below), re-bundle with --muse-usage,
@@ -109,23 +117,29 @@ follow-up's exact spec.
   must be an entry wallet of the submitting account — it is), source_bundle,
   duplicate_snapshot.
 
-**Thin margin to flag: thinking_reproduces 84.1% vs the competition's
-min_authored_coverage 0.8 — only 4.1 points above the gate.** The 72
+**Thin margin to flag: thinking_reproduces 87.9% vs the competition's
+min_authored_coverage 0.8 — 7.9 points above the gate.** The 73
 un-authored lines are race-mode lines identical to the OLD race's R4
 lineage, whose authoring sessions predate this competition's opening and
 were correctly excluded from the bundle (thinking_in_window). It passes
 locally; the server applies the same check, so it should pass there too —
-but the margin is thin and it is the one number to watch on the server's
-verdict.
+but the margin is the one number to watch on the server's verdict.
+(Note: if this REPORT.md is edited after the last bundle without a
+re-bundle, its new lines count as un-authored and the percentage drops —
+the parent's re-bundle with usage rows covers the final file as written.)
 
 ## Bundle
 
-`~/workspace/makefun/btc-race-entry/transcripts-race2-twomode.tar.gz`
-sha256 `eac85bff7d18011cb6188185427ab688b0b8c0b168531500e48d03221cd3cea9`,
-1,660,931 bytes, 6 sessions (builder 391829ff, parent 450e04ab, and the
+`~/workspace/makefun/btc-race-entry/transcripts-race2-twomode-v2.tar.gz`
+sha256 `e3b128eb1c79c4d1cc1698da86c1b17b0032dcca775c1350aec7705246c0712b`,
+1,675,372 bytes, 6 sessions (builder 391829ff, parent 450e04ab, and the
 test/rebuild sessions 1fc23132, 24d1de62, 624a744b, e300ba1f). Run record:
 prompt handed-off ("Ya, build two-mode tabel DP"), system prompt uploaded,
-instructions collected, MCP none. **0 usage rows attached — parent to add.**
+instructions collected, MCP none. **0 usage rows attached — parent to add
+(the bundle sha WILL change again when the parent re-bundles with usage;
+that is expected — re-check at the final HEAD after the re-bundle).**
+(The first bundle, `transcripts-race2-twomode.tar.gz` sha eac85bff…,
+is superseded by v2.)
 
 Usage agent ids for the parent's SELECT (first line of each session file):
 391829ff-b22f-405a-98d4-88d37b1ffe81 (builder), 450e04ab-ab50-41e8-97f9-b6d86f5a0b7a
@@ -166,9 +180,9 @@ decision after he sees these numbers.**
 ## What the parent must do before any submit
 
 1. Run the muse.db SELECT for the 6 agent ids above, write the rows to a
-   `.jsonl` file, re-bundle with `--muse-usage <file>`, re-check — expect
-   15/0 (thinking_priced fixed). The bundle sha WILL change; record the new
-   one.
+   `.jsonl` file, re-bundle with `--muse-usage <file>`, re-check at the
+   final HEAD — expect 15/0 (thinking_priced fixed). The bundle sha WILL
+   change; record the new one. (Do NOT submit the pre-usage bundle v2.)
 2. Recheck quota (`quota-check-btc-race-20261118-1444.mjs`) — must be
    can_submit true.
 3. Show Fxzy this report. Submit ONLY on his go-ahead, with:
