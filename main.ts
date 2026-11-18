@@ -33,8 +33,10 @@
 //   checks-rejected BTC entry does NOT count against quota.
 // - Race mode trades rarely by design (1 trade in 7 OOS days). If it
 //   fires 0 trades in the race window, the entry meets no guardrail
-//   (>=1 trade) and takes no prize — the micro-trade guard revision
-//   (after v1 grades) addresses exactly this.
+//   (>=1 trade) and takes no prize — the micro-trade guard (revision,
+//   after v1 graded) addresses exactly this: one fallback trade at the
+//   largest pullback seen so far, from bar 1200, half size, relaxed
+//   drift floor -100 bps, same fast exits.
 //
 // DETERMINISM: no randomness, no wall clock, no environment reads. Mode
 // is chosen from the BAR TIMESTAMP (data the harness sends), never from
@@ -117,6 +119,16 @@ const MAX_TRADES = 3; // hard cap on entries for the whole race
 const COOLDOWN_BARS = 10; // bars to wait after a full exit
 const NO_ENTRY_AFTER = 1380; // no NEW entries in the last 60 bars
 const HL_LOOKBACK = 60; // higher-low gate: lookback for the prior 60-bar low
+// Micro-trade guard (revision after v1): if the selective race mode has
+// still fired 0 trades by bar ~1200, take ONE fallback trade so the
+// entry meets the race guardrail (>=1 trade). Relaxed vs normal: drift
+// may be >= -100 bps (not >= 0), no higher-low and no range-position
+// gate; the entry must be the largest pullback from the trailing
+// 120-bar high seen so far in this window, ATR60 <= 10, size 50%.
+// Last entry still before bar 1380. Worst case ~-$2-3 (stop -15 bps
+// on a half-size position + fees) vs $0 prize for sure with 0 trades.
+const GUARD_AFTER = 1200; // guard arms at this bar (race mode only)
+const GUARD_DRIFT_MIN_BPS = -100; // relaxed drift floor for the guard trade
 const TP_BPS = 40; // take-profit: FULL exit at +40 bps
 const STOP_BPS = 15; // stop-loss: FULL exit at -15 bps
 const TIME_EXIT_BARS = 60; // time exit: 60 bars after entry
@@ -137,6 +149,9 @@ let coolUntil = -1; // seq before which no new entry may fire
 let tradesOpened = 0; // entries decided so far (hard-capped at MAX_TRADES)
 let devTrades = 0; // schedule-driven trades decided in dev mode
 let raceTrades = 0; // race-mode entries decided
+let guardTrades = 0; // micro-trade guard entries decided (max 1)
+let guardUsed = false; // the guard fires at most once per window
+let maxPbSoFar = 0; // largest pullback (bps) seen so far in this window
 const gateHits: Record<string, number> = {}; // how often each race gate blocked
 
 function noteGate(name: string): void {
@@ -324,100 +339,149 @@ function raceTrade(
   if (close === null) return [];
 
   // Indicators first (bandwidth advances once per flat batch, exactly
-  // like the validated backtest), then the eleven gates in order.
+  // like the validated backtest). Track the largest pullback seen so far
+  // — the micro-trade guard fires on a new maximum after bar 1200.
   const drift = driftBps();
   const atr = atrBps();
   const rangePos = rangePosition();
   const pb = pullbackBps();
   const bwInfo = bandwidthStep();
+  if (pb > maxPbSoFar) maxPbSoFar = pb;
 
-  if (seq < BLACKOUT_BARS) {
-    noteGate('blackout');
-    return [];
-  }
-  if (seq < coolUntil) {
-    noteGate('cooldown');
-    return [];
-  }
-  if (tradesOpened >= MAX_TRADES) {
-    noteGate('trade-cap');
-    return [];
-  }
-  if (seq >= NO_ENTRY_AFTER) {
-    noteGate('race-end');
-    return [];
-  }
-  if (dd > DD_HALT_NEW) {
-    noteGate('drawdown');
-    if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block drawdown dd=${(dd * 100).toFixed(2)}%>5% pb=${pb.toFixed(0)}bps`);
-    return [];
-  }
-  if (drift === null || drift < DRIFT_MIN_BPS) {
-    noteGate('drift');
-    if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block drift drift240=${drift === null ? 'n/a' : drift.toFixed(0) + 'bps'}<0 pb=${pb.toFixed(0)}bps`);
-    return [];
-  }
-  if (atr === null || atr > ATR_CEILING_BPS) {
-    noteGate('atr');
-    if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block atr atr60=${atr === null ? 'n/a' : atr.toFixed(1) + 'bps'}>10bps drift240=${drift.toFixed(0)}bps pb=${pb.toFixed(0)}bps`);
-    return [];
-  }
-  if (rangePos === null || rangePos > RANGE_TOP) {
-    noteGate('range-position');
-    if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block range-position rangePos=${rangePos === null ? 'n/a' : rangePos.toFixed(2)}>0.25 drift240=${drift.toFixed(0)}bps atr60=${atr.toFixed(1)}bps pb=${pb.toFixed(0)}bps`);
-    return [];
-  }
-  if (pb < PULLBACK_MIN_BPS) {
-    noteGate('pullback');
-    return [];
-  }
-  if (bwInfo === null || bwInfo.bwBps < BW_FLOOR_BPS || bwInfo.bwMeanBps === null || bwInfo.bwBps <= bwInfo.bwMeanBps * BW_EXPAND_RATIO) {
-    noteGate('bandwidth');
-    log(seq, 'HOLD', `gate-block bandwidth bw=${bwInfo === null ? 'n/a' : bwInfo.bwBps.toFixed(0) + 'bps'} bwMean=${bwInfo === null || bwInfo.bwMeanBps === null ? 'n/a' : bwInfo.bwMeanBps.toFixed(0) + 'bps'} drift240=${drift.toFixed(0)}bps atr60=${atr.toFixed(1)}bps rangePos=${rangePos.toFixed(2)} pb=${pb.toFixed(0)}bps`);
-    return [];
-  }
-  const hl = higherLow();
-  if (hl !== true) {
-    noteGate('higher-low');
-    if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block higher-low hl=${hl === null ? 'n/a' : hl} drift240=${drift.toFixed(0)}bps atr60=${atr.toFixed(1)}bps rangePos=${rangePos.toFixed(2)} pb=${pb.toFixed(0)}bps bw=${bwInfo.bwBps.toFixed(0)}bps`);
-    return [];
+  // The eleven normal gates, in order. Returns the blocking gate's name,
+  // or null when every gate passes. (Side effect: notes the gate + logs
+  // the block, exactly as the validated backtest's gate accounting.)
+  const normalBlocked = (): string | null => {
+    if (seq < BLACKOUT_BARS) {
+      noteGate('blackout');
+      return 'blackout';
+    }
+    if (seq < coolUntil) {
+      noteGate('cooldown');
+      return 'cooldown';
+    }
+    if (tradesOpened >= MAX_TRADES) {
+      noteGate('trade-cap');
+      return 'trade-cap';
+    }
+    if (seq >= NO_ENTRY_AFTER) {
+      noteGate('race-end');
+      return 'race-end';
+    }
+    if (dd > DD_HALT_NEW) {
+      noteGate('drawdown');
+      if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block drawdown dd=${(dd * 100).toFixed(2)}%>5% pb=${pb.toFixed(0)}bps`);
+      return 'drawdown';
+    }
+    if (drift === null || drift < DRIFT_MIN_BPS) {
+      noteGate('drift');
+      if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block drift drift240=${drift === null ? 'n/a' : drift.toFixed(0) + 'bps'}<0 pb=${pb.toFixed(0)}bps`);
+      return 'drift';
+    }
+    if (atr === null || atr > ATR_CEILING_BPS) {
+      noteGate('atr');
+      if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block atr atr60=${atr === null ? 'n/a' : atr.toFixed(1) + 'bps'}>10bps drift240=${drift.toFixed(0)}bps pb=${pb.toFixed(0)}bps`);
+      return 'atr';
+    }
+    if (rangePos === null || rangePos > RANGE_TOP) {
+      noteGate('range-position');
+      if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block range-position rangePos=${rangePos === null ? 'n/a' : rangePos.toFixed(2)}>0.25 drift240=${drift.toFixed(0)}bps atr60=${atr.toFixed(1)}bps pb=${pb.toFixed(0)}bps`);
+      return 'range-position';
+    }
+    if (pb < PULLBACK_MIN_BPS) {
+      noteGate('pullback');
+      return 'pullback';
+    }
+    if (bwInfo === null || bwInfo.bwBps < BW_FLOOR_BPS || bwInfo.bwMeanBps === null || bwInfo.bwBps <= bwInfo.bwMeanBps * BW_EXPAND_RATIO) {
+      noteGate('bandwidth');
+      log(seq, 'HOLD', `gate-block bandwidth bw=${bwInfo === null ? 'n/a' : bwInfo.bwBps.toFixed(0) + 'bps'} bwMean=${bwInfo === null || bwInfo.bwMeanBps === null ? 'n/a' : bwInfo.bwMeanBps.toFixed(0) + 'bps'} drift240=${drift.toFixed(0)}bps atr60=${atr.toFixed(1)}bps rangePos=${rangePos.toFixed(2)} pb=${pb.toFixed(0)}bps`);
+      return 'bandwidth';
+    }
+    const hl = higherLow();
+    if (hl !== true) {
+      noteGate('higher-low');
+      if (pb >= PULLBACK_MIN_BPS) log(seq, 'HOLD', `gate-block higher-low hl=${hl === null ? 'n/a' : hl} drift240=${drift.toFixed(0)}bps atr60=${atr.toFixed(1)}bps rangePos=${rangePos.toFixed(2)} pb=${pb.toFixed(0)}bps bw=${bwInfo.bwBps.toFixed(0)}bps`);
+      return 'higher-low';
+    }
+    return null;
+  };
+
+  // Size a buy at the given fraction of equity (whole USDC), or null when
+  // the size fails the min-notional / cash / weight-room checks.
+  const sizeBuy = (num: bigint, den: bigint): bigint | null => {
+    let size = (state.equity * num) / den;
+    size = (size / USDC) * USDC;
+    const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
+    const room = state.weightRoom(SYMBOL);
+    if (size < minNotional || size > state.cash || size > room || size <= 0n) {
+      noteGate('size');
+      log(seq, 'HOLD', `gate-block size size=${size} cash=${state.cash} room=${room} min=${minNotional}`);
+      return null;
+    }
+    return size;
+  };
+
+  const blocked = normalBlocked();
+  if (blocked === null) {
+    // ---- All eleven gates passed: size and buy (100% of equity). ----
+    // Half-size tier (ATR60 > 10 bps): UNREACHABLE while the entry gate
+    // already requires ATR <= 10 — kept exactly as specified, documented
+    // rather than silently dropped. 0%-size tier (drawdown > 5%):
+    // likewise unreachable — the drawdown gate blocks first.
+    if (atr !== null && atr > ATR_CEILING_BPS) noteGate('size-halved-atr');
+    if (dd > DD_HALT_NEW) {
+      log(seq, 'HOLD', 'gate-block size-zero-drawdown (unreachable: drawdown gate blocks first)');
+      return [];
+    }
+    const size = sizeBuy(1n, 1n);
+    if (size === null) return [];
+    entryClose = close;
+    entrySeq = seq;
+    tradesOpened += 1;
+    raceTrades += 1;
+    log(
+      seq,
+      'BUY',
+      `drift-gated support dip drift240=${drift === null ? 'n/a' : drift.toFixed(0) + 'bps'} atr60=${atr === null ? 'n/a' : atr.toFixed(1) + 'bps'} rangePos=${rangePos === null ? 'n/a' : rangePos.toFixed(2)} pb=${pb.toFixed(0)}bps bw=${bwInfo === null ? 'n/a' : bwInfo.bwBps.toFixed(0) + 'bps'} bwMean=${bwInfo === null || bwInfo.bwMeanBps === null ? 'n/a' : bwInfo.bwMeanBps.toFixed(0) + 'bps'} trade#${tradesOpened}/${MAX_TRADES}`,
+    );
+    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: size, max_slippage_bps: MAX_SLIP_BPS }];
   }
 
-  // ---- All eleven gates passed: size and buy (100% of equity). ----
-  // Half-size tier (ATR60 > 10 bps): UNREACHABLE while the entry gate
-  // already requires ATR <= 10 — kept exactly as specified, documented
-  // rather than silently dropped. 0%-size tier (drawdown > 5%):
-  // likewise unreachable — the drawdown gate blocks first.
-  let sizeNum = 1n;
-  let sizeDen = 1n;
-  if (atr > ATR_CEILING_BPS) {
-    sizeNum = 1n;
-    sizeDen = 2n;
-    noteGate('size-halved-atr');
+  // ---- Micro-trade guard (fires at most once, race mode only). ----
+  // The normal entry is blocked and no trade has fired yet. Take ONE
+  // fallback trade at the largest pullback seen so far, with relaxed
+  // gates (drift >= -100 bps, no higher-low, no range-position) and
+  // half size. The hard safety gates still apply: before bar 1380,
+  // drawdown <= 5%, ATR <= 10. Exits are the same TP+40 / stop-15 /
+  // time-60 as a normal trade.
+  const guardOk =
+    !guardUsed &&
+    tradesOpened === 0 &&
+    seq >= GUARD_AFTER &&
+    seq < NO_ENTRY_AFTER &&
+    dd <= DD_HALT_NEW &&
+    drift !== null &&
+    drift >= GUARD_DRIFT_MIN_BPS &&
+    atr !== null &&
+    atr <= ATR_CEILING_BPS &&
+    pb >= maxPbSoFar;
+  if (guardOk) {
+    const size = sizeBuy(1n, 2n);
+    if (size === null) return [];
+    guardUsed = true;
+    guardTrades += 1;
+    entryClose = close;
+    entrySeq = seq;
+    tradesOpened += 1;
+    raceTrades += 1;
+    log(
+      seq,
+      'GUARD-BUY',
+      `micro-trade guard (blocked by ${blocked}) drift240=${drift === null ? 'n/a' : drift.toFixed(0) + 'bps'} atr60=${atr === null ? 'n/a' : atr.toFixed(1) + 'bps'} pb=${pb.toFixed(0)}bps=maxSoFar size=50%`,
+    );
+    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: size, max_slippage_bps: MAX_SLIP_BPS }];
   }
-  if (dd > DD_HALT_NEW) {
-    log(seq, 'HOLD', 'gate-block size-zero-drawdown (unreachable: drawdown gate blocks first)');
-    return [];
-  }
-  let size = (state.equity * sizeNum) / sizeDen;
-  size = (size / USDC) * USDC;
-  const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
-  const room = state.weightRoom(SYMBOL);
-  if (size < minNotional || size > state.cash || size > room || size <= 0n) {
-    noteGate('size');
-    log(seq, 'HOLD', `gate-block size size=${size} cash=${state.cash} room=${room} min=${minNotional}`);
-    return [];
-  }
-  entryClose = close;
-  entrySeq = seq;
-  tradesOpened += 1;
-  raceTrades += 1;
-  log(
-    seq,
-    'BUY',
-    `drift-gated support dip drift240=${drift.toFixed(0)}bps atr60=${atr.toFixed(1)}bps rangePos=${rangePos.toFixed(2)} pb=${pb.toFixed(0)}bps bw=${bwInfo.bwBps.toFixed(0)}bps bwMean=${bwInfo.bwMeanBps === null ? 'n/a' : bwInfo.bwMeanBps.toFixed(0) + 'bps'} trade#${tradesOpened}/${MAX_TRADES}`,
-  );
-  return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: size, max_slippage_bps: MAX_SLIP_BPS }];
+  return [];
 }
 
 await runBars({
@@ -457,6 +521,6 @@ await runBars({
   },
 
   onDone(state: BarsState): void {
-    log(state.seq, 'DONE', `final equity=${state.equity} devTrades=${devTrades} raceTrades=${raceTrades} gateBlocks=${JSON.stringify(gateHits)}`);
+    log(state.seq, 'DONE', `final equity=${state.equity} devTrades=${devTrades} raceTrades=${raceTrades} guardTrades=${guardTrades} maxPbSoFar=${maxPbSoFar.toFixed(0)}bps gateBlocks=${JSON.stringify(gateHits)}`);
   },
 });
